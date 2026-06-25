@@ -57,4 +57,5 @@ dependencies = [
 [[package]]
 name = "sentencepiece-rust"
 version = "0.1.1"
-source = "git+https://github.com/VoiceLessQ/sentencepiece-rust?tag=v0.1.1#b47652a370f7eb6febbbeea193867a4c555b4ee3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60f271394c88f9c091ea275db6ed526566bb40a232e64dfe702c66cf47c3dee6"
