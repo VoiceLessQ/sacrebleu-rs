@@ -3,8 +3,9 @@
 A Rust port of [sacrebleu](https://github.com/mjpost/sacrebleu): reproducible machine-translation
 metrics. It is score-faithful to the Python package and verified by differential testing.
 
-Status: BLEU with the `13a` tokenizer is implemented and verified. chrF, TER, the `intl`/`char`
-tokenizers, and the reproducibility signature are planned.
+Status: BLEU (tokenizers `13a`, `intl`, `char`, `none`), chrF/chrF++, and TER are implemented,
+each with its reproducibility signature. The tokenizers that need external dependencies
+(`ja-mecab`, `ko-mecab`, `spm`/`flores`) and TER's Asian normalization are not included.
 
 ## Usage
 
@@ -23,24 +24,36 @@ let s = Bleu { effective_order: true, ..Bleu::default() }
     .sentence_score("the cat sat", &["the cat sat on the mat".to_string()]);
 ```
 
+```rust
+use sacrebleu_rs::{Chrf, Ter};
+
+let chrf = Chrf::default(); // word_order: 2 gives chrF++
+let ter = Ter::default();
+let h = ["the cat sat on the mat".to_string()];
+let r = [vec!["the cat sat on the mat".to_string()]];
+println!("{:.2}", chrf.corpus_score(&h, &r).score);
+println!("{:.2}", ter.corpus_score(&h, &r).score);
+```
+
 References use sacrebleu's layout: `refs[r][i]` is the r-th reference of the i-th hypothesis.
 
 ## Fidelity
 
-The deep core is score-faithful to sacrebleu 2.6.0: the `13a` tokenization, the integer n-gram
-sufficient statistics (counts, totals, lengths), the brevity penalty, and the four smoothing
-methods (`exp`, `floor`, `add-k`, `none`) all match the reference exactly.
+The deep core is score-faithful to sacrebleu 2.6.0: the tokenizations, the integer sufficient
+statistics (BLEU n-gram counts and lengths, chrF match counts, TER edits and reference lengths),
+the brevity penalty and smoothing, the chrF F-score, and the TER beam edit distance with shifts
+all match the reference exactly, as do the reproducibility signatures.
 
-The final score passes through `exp`/`log`, whose last bit can differ between Python's libm and
-Rust's, so the score is exact only to within floating-point tolerance. The integer statistics are
-exact, and the score matches to well within any reported precision. The surrounding API is an
+BLEU's final score passes through `exp`/`log`, whose last bit can differ between Python's libm and
+Rust's, so it is exact only to within floating-point tolerance; the integer statistics are exact.
+chrF and TER use only `+`, `*`, `/`, so they match even more tightly. The surrounding API is an
 idiomatic Rust translation rather than a line-for-line copy.
 
 ## Verification
 
 Behavior is checked by differential testing against the Python `sacrebleu` package (2.6.0). A
-matrix of corpora, smoothing methods, and options runs through both this crate and `BLEU`,
-comparing the integer sufficient statistics for exact equality and the score to within 1e-9.
+matrix of corpora and options runs through this crate and `BLEU`, `CHRF`, and `TER`, comparing the
+integer statistics and signatures for exact equality and each score to within 1e-9.
 
 ## License
 

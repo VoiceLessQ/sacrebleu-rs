@@ -629,6 +629,413 @@ impl Chrf {
     }
 }
 
+// --- TER (translation edit rate) -------------------------------------------------------------
+
+const TER_MAX_SHIFT_SIZE: usize = 10;
+const TER_MAX_SHIFT_DIST: i64 = 50;
+const TER_BEAM_WIDTH: i64 = 25;
+const TER_MAX_SHIFT_CANDIDATES: usize = 1000;
+const TER_INT_INFINITY: i64 = 10_000_000_000_000_000;
+
+// Edit op codes: b' ' = no-op, b'i' = insertion, b'd' = deletion, b's' = substitution.
+
+/// Beam-limited edit distance with operation traceback. Port of `BeamEditDistance` without the
+/// memoization cache (the cache only skips recomputation; the distance and trace are identical).
+struct BeamEd<'a> {
+    words_ref: &'a [String],
+    n_ref: usize,
+}
+
+impl<'a> BeamEd<'a> {
+    fn new(words_ref: &'a [String]) -> Self {
+        BeamEd { words_ref, n_ref: words_ref.len() }
+    }
+
+    /// Returns `(edit_distance, trace)`.
+    fn call(&self, words_h: &[String]) -> (i64, String) {
+        let n_h = words_h.len();
+        let n_ref = self.n_ref;
+        let mut dist = vec![vec![(TER_INT_INFINITY, b'x'); n_ref + 1]; n_h + 1];
+        // initial row: one insertion per reference word
+        for (j, cell) in dist[0].iter_mut().enumerate() {
+            *cell = (j as i64, b'i');
+        }
+
+        let length_ratio = if n_h > 0 { n_ref as f64 / n_h as f64 } else { 1.0 };
+        let beam_width = if (TER_BEAM_WIDTH as f64) < length_ratio / 2.0 {
+            (length_ratio / 2.0 + TER_BEAM_WIDTH as f64).ceil() as i64
+        } else {
+            TER_BEAM_WIDTH
+        };
+
+        for i in 1..=n_h {
+            let pseudo_diag = (i as f64 * length_ratio).floor() as i64;
+            let min_j = (pseudo_diag - beam_width).max(0);
+            let mut max_j = (pseudo_diag + beam_width).min(n_ref as i64 + 1);
+            if i == n_h {
+                max_j = n_ref as i64 + 1;
+            }
+            // The beam loop reads neighbouring matrix cells by index, so a range loop is correct.
+            #[allow(clippy::needless_range_loop)]
+            for j in min_j..max_j {
+                let j = j as usize;
+                if j == 0 {
+                    dist[i][0] = (dist[i - 1][0].0 + 1, b'd');
+                } else {
+                    let (cost_sub, op_sub) = if words_h[i - 1] == self.words_ref[j - 1] {
+                        (0, b' ')
+                    } else {
+                        (1, b's')
+                    };
+                    let ops = [
+                        (dist[i - 1][j - 1].0 + cost_sub, op_sub),
+                        (dist[i - 1][j].0 + 1, b'd'),
+                        (dist[i][j - 1].0 + 1, b'i'),
+                    ];
+                    for (oc, on) in ops {
+                        if dist[i][j].0 > oc {
+                            dist[i][j] = (oc, on);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut trace: Vec<u8> = Vec::new();
+        let (mut i, mut j) = (n_h, n_ref);
+        while i > 0 || j > 0 {
+            let op = dist[i][j].1;
+            trace.push(op);
+            match op {
+                b's' | b' ' => {
+                    i -= 1;
+                    j -= 1;
+                }
+                b'i' => j -= 1,
+                b'd' => i -= 1,
+                _ => panic!("unknown TER edit op"),
+            }
+        }
+        trace.reverse();
+        (dist[n_h][n_ref].0, String::from_utf8(trace).unwrap())
+    }
+}
+
+fn flip_trace(trace: &str) -> String {
+    trace
+        .chars()
+        .map(|c| match c {
+            'i' => 'd',
+            'd' => 'i',
+            x => x,
+        })
+        .collect()
+}
+
+/// Port of `trace_to_alignment`: `(align, ref_err, hyp_err)`.
+fn trace_to_alignment(trace: &str) -> (HashMap<i64, i64>, Vec<i64>, Vec<i64>) {
+    let mut pos_hyp: i64 = -1;
+    let mut pos_ref: i64 = -1;
+    let mut hyp_err = Vec::new();
+    let mut ref_err = Vec::new();
+    let mut align = HashMap::new();
+    for op in trace.chars() {
+        match op {
+            ' ' => {
+                pos_hyp += 1;
+                pos_ref += 1;
+                align.insert(pos_ref, pos_hyp);
+                hyp_err.push(0);
+                ref_err.push(0);
+            }
+            's' => {
+                pos_hyp += 1;
+                pos_ref += 1;
+                align.insert(pos_ref, pos_hyp);
+                hyp_err.push(1);
+                ref_err.push(1);
+            }
+            'i' => {
+                pos_hyp += 1;
+                hyp_err.push(1);
+            }
+            'd' => {
+                pos_ref += 1;
+                align.insert(pos_ref, pos_hyp);
+                ref_err.push(1);
+            }
+            _ => panic!("unknown TER trace op"),
+        }
+    }
+    (align, ref_err, hyp_err)
+}
+
+/// Port of `_find_shifted_pairs`: matching `(start_h, start_r, length)` sub-sequences.
+fn find_shifted_pairs(words_h: &[String], words_r: &[String]) -> Vec<(usize, usize, usize)> {
+    let n_h = words_h.len();
+    let n_r = words_r.len();
+    let mut out = Vec::new();
+    for start_h in 0..n_h {
+        for start_r in 0..n_r {
+            if (start_r as i64 - start_h as i64).abs() > TER_MAX_SHIFT_DIST {
+                continue;
+            }
+            let mut length = 0usize;
+            loop {
+                if !(start_h + length < n_h
+                    && start_r + length < n_r
+                    && words_h[start_h + length] == words_r[start_r + length]
+                    && length < TER_MAX_SHIFT_SIZE)
+                {
+                    break;
+                }
+                length += 1;
+                out.push((start_h, start_r, length));
+                if n_h == start_h + length || n_r == start_r + length {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Port of `_perform_shift`. End indices are clamped (the algorithm keeps them in range).
+fn perform_shift(words: &[String], start: usize, length: usize, target: usize) -> Vec<String> {
+    let n = words.len();
+    let cl = |x: usize| x.min(n);
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    if target < start {
+        out.extend_from_slice(&words[..cl(target)]);
+        out.extend_from_slice(&words[cl(start)..cl(start + length)]);
+        out.extend_from_slice(&words[cl(target)..cl(start)]);
+        out.extend_from_slice(&words[cl(start + length)..]);
+    } else if target > start + length {
+        out.extend_from_slice(&words[..cl(start)]);
+        out.extend_from_slice(&words[cl(start + length)..cl(target)]);
+        out.extend_from_slice(&words[cl(start)..cl(start + length)]);
+        out.extend_from_slice(&words[cl(target)..]);
+    } else {
+        out.extend_from_slice(&words[..cl(start)]);
+        out.extend_from_slice(&words[cl(start + length)..cl(length + target)]);
+        out.extend_from_slice(&words[cl(start)..cl(start + length)]);
+        out.extend_from_slice(&words[cl(length + target)..]);
+    }
+    out
+}
+
+/// Port of `_shift`: the best single shift that most reduces the edit distance.
+fn ter_shift(
+    words_h: &[String],
+    words_r: &[String],
+    ed: &BeamEd,
+    mut checked: usize,
+) -> (i64, Vec<String>, usize) {
+    let (pre_score, inv_trace) = ed.call(words_h);
+    let trace = flip_trace(&inv_trace);
+    let (align, ref_err, hyp_err) = trace_to_alignment(&trace);
+
+    let mut best: Option<(i64, i64, i64, i64, Vec<String>)> = None;
+
+    for (start_h, start_r, length) in find_shifted_pairs(words_h, words_r) {
+        if hyp_err[start_h..start_h + length].iter().sum::<i64>() == 0 {
+            continue;
+        }
+        if ref_err[start_r..start_r + length].iter().sum::<i64>() == 0 {
+            continue;
+        }
+        let a = *align.get(&(start_r as i64)).unwrap();
+        if (start_h as i64) <= a && a < (start_h + length) as i64 {
+            continue;
+        }
+
+        let mut prev_idx: i64 = -1;
+        for offset in -1i64..length as i64 {
+            let idx: i64 = if start_r as i64 + offset == -1 {
+                0
+            } else if let Some(&av) = align.get(&(start_r as i64 + offset)) {
+                av + 1
+            } else {
+                break;
+            };
+            if idx == prev_idx {
+                continue;
+            }
+            prev_idx = idx;
+
+            let shifted = perform_shift(words_h, start_h, length, idx as usize);
+            let sc = pre_score - ed.call(&shifted).0;
+            let cand = (sc, length as i64, -(start_h as i64), -idx, shifted);
+            checked += 1;
+            if best.as_ref().is_none_or(|b| cand > *b) {
+                best = Some(cand);
+            }
+        }
+
+        if checked >= TER_MAX_SHIFT_CANDIDATES {
+            break;
+        }
+    }
+
+    match best {
+        None => (0, words_h.to_vec(), checked),
+        Some((sc, _, _, _, sw)) => (sc, sw, checked),
+    }
+}
+
+/// Port of `translation_edit_rate`: `(num_edits, ref_len)`.
+fn translation_edit_rate(words_hyp: &[String], words_ref: &[String]) -> (i64, i64) {
+    let n_ref = words_ref.len();
+    let n_hyp = words_hyp.len();
+    if n_ref == 0 {
+        return (n_hyp as i64, 0);
+    }
+
+    let ed = BeamEd::new(words_ref);
+    let mut shifts = 0i64;
+    let mut input_words = words_hyp.to_vec();
+    let mut checked = 0usize;
+    loop {
+        let (delta, new_input, c) = ter_shift(&input_words, words_ref, &ed, checked);
+        checked = c;
+        if checked >= TER_MAX_SHIFT_CANDIDATES {
+            break;
+        }
+        if delta <= 0 {
+            break;
+        }
+        shifts += 1;
+        input_words = new_input;
+    }
+
+    let (edit_distance, _trace) = ed.call(&input_words);
+    (shifts + edit_distance, n_ref as i64)
+}
+
+// --- TER tokenizer (Tercom, Western path) ----------------------------------------------------
+
+fn ter_norm_rules() -> &'static [(Regex, &'static str)] {
+    static RULES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        vec![
+            (Regex::new(r"([\x20-\x26\x28-\x2b\x2f\x3a-\x40\x5b-\x60\x7b-\x7e])").unwrap(), " $1 "),
+            (Regex::new(r"'s$").unwrap(), " 's"),
+            (Regex::new(r"([^0-9])([\.,])").unwrap(), "$1 $2 "),
+            (Regex::new(r"([\.,])([^0-9])").unwrap(), " $1 $2"),
+            (Regex::new(r"([0-9])(-)").unwrap(), "$1 $2 "),
+        ]
+    })
+}
+
+/// Port of `_normalize_general_and_western` (Tercom). Asian normalization is not implemented.
+fn ter_normalize_western(sent: &str) -> String {
+    let mut s = sent.replace("\n-", "");
+    s = s.replace('\n', " ");
+    s = s.replace("&quot;", "\"");
+    s = s.replace("&amp;", "&");
+    s = s.replace("&lt;", "<");
+    s = s.replace("&gt;", ">");
+    s = format!(" {s} ");
+    let rules = ter_norm_rules();
+    // rule 0 (punctuation), then possessive " 's ", then 's$, then the period/comma/dash rules
+    s = rules[0].0.replace_all(&s, rules[0].1).into_owned();
+    s = s.replace("'s ", " 's ");
+    s = rules[1].0.replace_all(&s, rules[1].1).into_owned();
+    for (re, repl) in &rules[2..] {
+        s = re.replace_all(&s, *repl).into_owned();
+    }
+    s
+}
+
+fn ter_remove_punct(sent: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"[.,?:;!"()]"#).unwrap());
+    re.replace_all(sent, "").into_owned()
+}
+
+/// The result of a TER computation. Mirrors sacrebleu's `TERScore`.
+#[derive(Debug, Clone)]
+pub struct TerScore {
+    pub score: f64,
+    pub num_edits: i64,
+    pub ref_length: f64,
+}
+
+/// The TER metric. Mirrors sacrebleu's `TER` (Western tokenization; Asian support not implemented).
+#[derive(Debug, Clone, Default)]
+pub struct Ter {
+    pub normalized: bool,
+    pub no_punct: bool,
+    pub case_sensitive: bool,
+}
+
+impl Ter {
+    fn preprocess(&self, sent: &str) -> Vec<String> {
+        let sent = sent.trim_end();
+        if sent.is_empty() {
+            return Vec::new();
+        }
+        let mut s = if self.case_sensitive { sent.to_string() } else { sent.to_lowercase() };
+        if self.normalized {
+            s = ter_normalize_western(&s);
+        }
+        if self.no_punct {
+            s = ter_remove_punct(&s);
+        }
+        s.split_whitespace().map(|w| w.to_string()).collect()
+    }
+
+    /// Corpus-level TER. `refs` uses sacrebleu's layout (`refs[r][i]`); the reference giving the
+    /// fewest edits is chosen per segment, against the average reference length.
+    pub fn corpus_score(&self, hyps: &[String], refs: &[Vec<String>]) -> TerScore {
+        let mut total_edits = 0f64;
+        let mut sum_ref_lengths = 0f64;
+        let n_refs = refs.len();
+
+        for (i, hyp) in hyps.iter().enumerate() {
+            let words_hyp = self.preprocess(hyp);
+            let mut ref_lengths = 0f64;
+            let mut best_num_edits = TER_INT_INFINITY;
+            for stream in refs {
+                let words_ref = self.preprocess(&stream[i]);
+                let (num_edits, ref_len) = translation_edit_rate(&words_hyp, &words_ref);
+                ref_lengths += ref_len as f64;
+                if num_edits < best_num_edits {
+                    best_num_edits = num_edits;
+                }
+            }
+            total_edits += best_num_edits as f64;
+            sum_ref_lengths += ref_lengths / n_refs as f64;
+        }
+
+        let score = if sum_ref_lengths > 0.0 {
+            total_edits / sum_ref_lengths
+        } else if total_edits > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+
+        TerScore { score: 100.0 * score, num_edits: total_edits as i64, ref_length: sum_ref_lengths }
+    }
+
+    /// Sentence-level TER against one or more references.
+    pub fn sentence_score(&self, hyp: &str, refs: &[String]) -> TerScore {
+        let streams: Vec<Vec<String>> = refs.iter().map(|r| vec![r.clone()]).collect();
+        self.corpus_score(&[hyp.to_string()], &streams)
+    }
+
+    /// The reproducibility signature, e.g.
+    /// `nrefs:1|case:lc|tok:tercom|norm:no|punct:yes|asian:no|version:2.6.0`.
+    pub fn signature(&self, num_refs: i64) -> String {
+        let nrefs = if num_refs == -1 { "var".to_string() } else { num_refs.to_string() };
+        let case = if self.case_sensitive { "mixed" } else { "lc" };
+        let norm = if self.normalized { "yes" } else { "no" };
+        let punct = if !self.no_punct { "yes" } else { "no" };
+        format!("nrefs:{nrefs}|case:{case}|tok:tercom|norm:{norm}|punct:{punct}|asian:no|version:{VERSION}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,5 +1116,23 @@ mod tests {
         let s2 = cpp.corpus_score(&["the cat".to_string()], &[vec!["the cat".to_string()]]);
         assert_eq!(s2.name(), "chrF2++");
         assert!((s2.score - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ter_basics() {
+        let t = Ter::default();
+        let perfect = t.corpus_score(&["the cat sat".to_string()], &[vec!["the cat sat".to_string()]]);
+        assert_eq!(perfect.score, 0.0);
+        assert_eq!(perfect.num_edits, 0);
+
+        // one substitution against a 3-word reference -> 1/3
+        let one_sub = t.corpus_score(&["the cat sat".to_string()], &[vec!["the cat ran".to_string()]]);
+        assert_eq!(one_sub.num_edits, 1);
+        assert!((one_sub.score - 100.0 / 3.0).abs() < 1e-9);
+
+        assert_eq!(
+            t.signature(1),
+            "nrefs:1|case:lc|tok:tercom|norm:no|punct:yes|asian:no|version:2.6.0"
+        );
     }
 }
