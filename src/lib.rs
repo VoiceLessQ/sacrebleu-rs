@@ -12,7 +12,9 @@
 
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+pub use sentencepiece_rust::SentencePieceProcessor;
 
 /// The default maximum n-gram order.
 pub const MAX_NGRAM_ORDER: usize = 4;
@@ -297,16 +299,19 @@ pub fn compute_bleu(
 
 // --- public metric ---------------------------------------------------------------------------
 
-/// The BLEU metric. Mirrors sacrebleu's `BLEU` (this slice uses the `13a` tokenizer).
-#[derive(Debug, Clone)]
+/// The BLEU metric. Mirrors sacrebleu's `BLEU`.
+#[derive(Clone)]
 pub struct Bleu {
     pub lowercase: bool,
     pub smooth_method: String,
     pub smooth_value: Option<f64>,
     pub max_ngram_order: usize,
     pub effective_order: bool,
-    /// Tokenizer name: `13a` (default), `intl`, `char`, or `none`.
+    /// Tokenizer name: `13a` (default), `intl`, `char`, `none`, or an spm name
+    /// (`spm`/`flores101`/`flores200`/`spBLEU-1K`), which also needs `spm_model`.
     pub tokenize: String,
+    /// The SentencePiece model for the spm/flores tokenizers (ignored otherwise).
+    pub spm_model: Option<Arc<SentencePieceProcessor>>,
 }
 
 impl Default for Bleu {
@@ -318,6 +323,7 @@ impl Default for Bleu {
             max_ngram_order: MAX_NGRAM_ORDER,
             effective_order: false,
             tokenize: "13a".to_string(),
+            spm_model: None,
         }
     }
 }
@@ -331,7 +337,14 @@ impl Bleu {
         } else {
             sent
         };
-        apply_tokenizer(&self.tokenize, s.trim_end())
+        let s = s.trim_end();
+        match self.tokenize.as_str() {
+            "spm" | "flores101" | "flores200" | "spBLEU-1K" => {
+                let sp = self.spm_model.as_ref().expect("spm tokenizer requires spm_model");
+                encode_as_pieces(sp, s)
+            }
+            _ => apply_tokenizer(&self.tokenize, s),
+        }
     }
 
     /// Corpus-level BLEU. `refs` is a list of reference *streams* (sacrebleu layout): `refs[r][i]`
@@ -386,7 +399,19 @@ fn tokenizer_signature(name: &str) -> &str {
         "intl" => "intl",
         "char" => "char",
         "none" => "none",
+        "spm" | "flores101" => "flores101",
+        "flores200" => "flores200",
+        "spBLEU-1K" => "spBLEU-1K",
         _ => "13a",
+    }
+}
+
+/// `EncodeAsPieces` via sentencepiece-rust: the surface pieces joined with spaces (unknown tokens
+/// keep their text, matching sacrebleu's spm tokenizer).
+pub fn encode_as_pieces(sp: &SentencePieceProcessor, line: &str) -> String {
+    match sp.encode_pieces(line) {
+        Ok(pieces) => pieces.join(" "),
+        Err(_) => String::new(),
     }
 }
 

@@ -51,4 +51,9 @@ name = "sacrebleu-rs"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "sentencepiece-rust",
 ]
+
+[[package]]
+name = "sentencepiece-rust"
+version = "0.1.1"
