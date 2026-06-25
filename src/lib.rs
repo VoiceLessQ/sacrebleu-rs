@@ -17,6 +17,9 @@ use std::sync::OnceLock;
 /// The default maximum n-gram order.
 pub const MAX_NGRAM_ORDER: usize = 4;
 
+/// The sacrebleu version embedded in reproducibility signatures (the pinned oracle version).
+pub const VERSION: &str = "2.6.0";
+
 // --- tokenizer: 13a (deep core, byte-exact) --------------------------------------------------
 
 fn regexp_rules() -> &'static [(Regex, &'static str)] {
@@ -363,6 +366,36 @@ impl Bleu {
         let streams: Vec<Vec<String>> = refs.iter().map(|r| vec![r.clone()]).collect();
         self.corpus_score(&[hyp.to_string()], &streams)
     }
+
+    /// The reproducibility signature, e.g.
+    /// `nrefs:1|case:mixed|eff:no|tok:13a|smooth:exp|version:2.6.0`. Pass the number of reference
+    /// streams (or -1 for a variable number), as sacrebleu reports `nrefs:var` in that case.
+    pub fn signature(&self, num_refs: i64) -> String {
+        let nrefs = if num_refs == -1 { "var".to_string() } else { num_refs.to_string() };
+        let case = if self.lowercase { "lc" } else { "mixed" };
+        let eff = if self.effective_order { "yes" } else { "no" };
+        let tok = tokenizer_signature(&self.tokenize);
+        let smooth = smooth_signature(&self.smooth_method, self.smooth_value);
+        format!("nrefs:{nrefs}|case:{case}|eff:{eff}|tok:{tok}|smooth:{smooth}|version:{VERSION}")
+    }
+}
+
+/// The signature name for a tokenizer (matches sacrebleu's `signature()` methods).
+fn tokenizer_signature(name: &str) -> &str {
+    match name {
+        "intl" => "intl",
+        "char" => "char",
+        "none" => "none",
+        _ => "13a",
+    }
+}
+
+/// The `smooth` field of the signature: the method, plus `[value]` for `floor`/`add-k`.
+fn smooth_signature(method: &str, value: Option<f64>) -> String {
+    match smooth_default(method) {
+        Some(def) => format!("{method}[{:.2}]", value.unwrap_or(def)),
+        None => method.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -409,5 +442,24 @@ mod tests {
         assert_eq!(tokenize_intl("3.14"), "3.14"); // a dot between digits stays
         assert_eq!(tokenize_intl("a+b"), "a + b"); // '+' is a symbol
         assert_eq!(apply_tokenizer("none", "a , b"), "a , b"); // identity
+    }
+
+    #[test]
+    fn signatures() {
+        assert_eq!(
+            Bleu::default().signature(1),
+            "nrefs:1|case:mixed|eff:no|tok:13a|smooth:exp|version:2.6.0"
+        );
+        let b = Bleu {
+            lowercase: true,
+            effective_order: true,
+            smooth_method: "floor".to_string(),
+            tokenize: "intl".to_string(),
+            ..Bleu::default()
+        };
+        assert_eq!(
+            b.signature(2),
+            "nrefs:2|case:lc|eff:yes|tok:intl|smooth:floor[0.10]|version:2.6.0"
+        );
     }
 }
