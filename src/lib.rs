@@ -398,6 +398,237 @@ fn smooth_signature(method: &str, value: Option<f64>) -> String {
     }
 }
 
+// --- chrF / chrF++ ---------------------------------------------------------------------------
+
+/// Character n-grams (orders 1..=`max_order`) of a line. Whitespace is removed first unless
+/// `include_ws`. Port of `extract_all_char_ngrams`.
+fn extract_all_char_ngrams(line: &str, max_order: usize, include_ws: bool) -> Vec<HashMap<String, i64>> {
+    let chars: Vec<char> = if include_ws {
+        line.chars().collect()
+    } else {
+        line.split_whitespace().collect::<Vec<_>>().join("").chars().collect()
+    };
+    let mut out = Vec::with_capacity(max_order);
+    for n in 1..=max_order {
+        let mut c: HashMap<String, i64> = HashMap::new();
+        if chars.len() >= n {
+            for i in 0..=chars.len() - n {
+                let ng: String = chars[i..i + n].iter().collect();
+                *c.entry(ng).or_insert(0) += 1;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Word n-grams of order `n` over `words`, keyed by the space-joined token. Port of
+/// `extract_word_ngrams`.
+fn extract_word_ngrams(words: &[String], n: usize) -> HashMap<String, i64> {
+    let mut c: HashMap<String, i64> = HashMap::new();
+    if words.len() >= n {
+        for i in 0..=words.len() - n {
+            *c.entry(words[i..i + n].join(" ")).or_insert(0) += 1;
+        }
+    }
+    c
+}
+
+const CHRF_PUNCTS: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+
+/// Port of `CHRF._remove_punctuation`: split punctuation off the ends of multi-char words.
+fn remove_punctuation(sent: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in sent.split_whitespace() {
+        let cs: Vec<char> = w.chars().collect();
+        if cs.len() == 1 {
+            out.push(w.to_string());
+        } else if CHRF_PUNCTS.contains(cs[cs.len() - 1]) {
+            out.push(cs[..cs.len() - 1].iter().collect());
+            out.push(cs[cs.len() - 1].to_string());
+        } else if CHRF_PUNCTS.contains(cs[0]) {
+            out.push(cs[0].to_string());
+            out.push(cs[1..].iter().collect());
+        } else {
+            out.push(w.to_string());
+        }
+    }
+    out
+}
+
+/// Port of `CHRF._get_match_statistics`: `[hyp_count, ref_count, match_count]` for one order.
+fn chrf_match_stats(hyp: &HashMap<String, i64>, refc: &HashMap<String, i64>) -> [i64; 3] {
+    let mut match_count = 0i64;
+    let mut hyp_count = 0i64;
+    for (ng, &count) in hyp {
+        hyp_count += count;
+        if let Some(&rc) = refc.get(ng) {
+            match_count += count.min(rc);
+        }
+    }
+    let ref_total: i64 = refc.values().sum();
+    [if refc.is_empty() { 0 } else { hyp_count }, ref_total, match_count]
+}
+
+/// Port of `CHRF._compute_f_score`.
+fn chrf_f_score(stats: &[i64], order: usize, beta: i64, eps_smoothing: bool) -> f64 {
+    let eps = 1e-16;
+    let mut score = 0.0;
+    let mut effective_order = 0usize;
+    let factor = (beta * beta) as f64;
+    let mut avg_prec = 0.0;
+    let mut avg_rec = 0.0;
+
+    for i in 0..order {
+        let n_hyp = stats[3 * i] as f64;
+        let n_ref = stats[3 * i + 1] as f64;
+        let n_match = stats[3 * i + 2] as f64;
+
+        let prec = if n_hyp > 0.0 { n_match / n_hyp } else { eps };
+        let rec = if n_ref > 0.0 { n_match / n_ref } else { eps };
+
+        let denom = factor * prec + rec;
+        score += if denom > 0.0 { (1.0 + factor) * prec * rec / denom } else { eps };
+
+        if n_hyp > 0.0 && n_ref > 0.0 {
+            avg_prec += prec;
+            avg_rec += rec;
+            effective_order += 1;
+        }
+    }
+
+    if eps_smoothing {
+        return 100.0 * score / order as f64;
+    }
+
+    if effective_order == 0 {
+        avg_prec = 0.0;
+        avg_rec = 0.0;
+    } else {
+        avg_prec /= effective_order as f64;
+        avg_rec /= effective_order as f64;
+    }
+
+    if avg_prec + avg_rec != 0.0 {
+        let s = (1.0 + factor) * avg_prec * avg_rec / (factor * avg_prec + avg_rec);
+        100.0 * s
+    } else {
+        0.0
+    }
+}
+
+/// The result of a chrF computation. Mirrors sacrebleu's `CHRFScore`.
+#[derive(Debug, Clone)]
+pub struct ChrfScore {
+    pub score: f64,
+    pub char_order: usize,
+    pub word_order: usize,
+    pub beta: i64,
+}
+
+impl ChrfScore {
+    /// `chrF{beta}` plus a `+` per word order, e.g. `chrF2` or `chrF2++`.
+    pub fn name(&self) -> String {
+        format!("chrF{}{}", self.beta, "+".repeat(self.word_order))
+    }
+}
+
+/// The chrF / chrF++ metric. Mirrors sacrebleu's `CHRF`.
+#[derive(Debug, Clone)]
+pub struct Chrf {
+    pub char_order: usize,
+    pub word_order: usize,
+    pub beta: i64,
+    pub lowercase: bool,
+    pub whitespace: bool,
+    pub eps_smoothing: bool,
+}
+
+impl Default for Chrf {
+    fn default() -> Self {
+        Chrf {
+            char_order: 6,
+            word_order: 0,
+            beta: 2,
+            lowercase: false,
+            whitespace: false,
+            eps_smoothing: false,
+        }
+    }
+}
+
+impl Chrf {
+    fn order(&self) -> usize {
+        self.char_order + self.word_order
+    }
+
+    fn segment_ngrams(&self, sent: &str) -> Vec<HashMap<String, i64>> {
+        let mut v = extract_all_char_ngrams(sent, self.char_order, self.whitespace);
+        if self.word_order > 0 {
+            let words = remove_punctuation(sent);
+            for n in 1..=self.word_order {
+                v.push(extract_word_ngrams(&words, n));
+            }
+        }
+        v
+    }
+
+    fn preprocess(&self, sent: &str) -> String {
+        if self.lowercase { sent.to_lowercase() } else { sent.to_string() }
+    }
+
+    /// Corpus-level chrF. `refs` uses sacrebleu's layout (`refs[r][i]` is the r-th reference of
+    /// the i-th hypothesis); the best-matching reference is chosen per segment.
+    pub fn corpus_score(&self, hyps: &[String], refs: &[Vec<String>]) -> ChrfScore {
+        let order = self.order();
+        let mut agg = vec![0i64; 3 * order];
+
+        for (i, hyp) in hyps.iter().enumerate() {
+            let hyp_ng = self.segment_ngrams(&self.preprocess(hyp));
+
+            let mut best_stats: Vec<i64> = Vec::new();
+            let mut best_f = -1.0;
+            for stream in refs {
+                let ref_ng = self.segment_ngrams(&self.preprocess(&stream[i]));
+                let mut stats = Vec::with_capacity(3 * order);
+                for (h, r) in hyp_ng.iter().zip(ref_ng.iter()) {
+                    stats.extend_from_slice(&chrf_match_stats(h, r));
+                }
+                let f = chrf_f_score(&stats, order, self.beta, self.eps_smoothing);
+                if f > best_f {
+                    best_f = f;
+                    best_stats = stats;
+                }
+            }
+            for (a, s) in agg.iter_mut().zip(best_stats) {
+                *a += s;
+            }
+        }
+
+        let score = chrf_f_score(&agg, order, self.beta, self.eps_smoothing);
+        ChrfScore { score, char_order: self.char_order, word_order: self.word_order, beta: self.beta }
+    }
+
+    /// Sentence-level chrF against one or more references.
+    pub fn sentence_score(&self, hyp: &str, refs: &[String]) -> ChrfScore {
+        let streams: Vec<Vec<String>> = refs.iter().map(|r| vec![r.clone()]).collect();
+        self.corpus_score(&[hyp.to_string()], &streams)
+    }
+
+    /// The reproducibility signature, e.g.
+    /// `nrefs:1|case:mixed|eff:yes|nc:6|nw:0|space:no|version:2.6.0`.
+    pub fn signature(&self, num_refs: i64) -> String {
+        let nrefs = if num_refs == -1 { "var".to_string() } else { num_refs.to_string() };
+        let case = if self.lowercase { "lc" } else { "mixed" };
+        let eff = if !self.eps_smoothing { "yes" } else { "no" };
+        let space = if self.whitespace { "yes" } else { "no" };
+        format!(
+            "nrefs:{nrefs}|case:{case}|eff:{eff}|nc:{}|nw:{}|space:{space}|version:{VERSION}",
+            self.char_order, self.word_order
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +692,22 @@ mod tests {
             b.signature(2),
             "nrefs:2|case:lc|eff:yes|tok:intl|smooth:floor[0.10]|version:2.6.0"
         );
+    }
+
+    #[test]
+    fn chrf_basics() {
+        let c = Chrf::default();
+        let s = c.corpus_score(&["the cat".to_string()], &[vec!["the cat".to_string()]]);
+        assert!((s.score - 100.0).abs() < 1e-9);
+        assert_eq!(s.name(), "chrF2");
+        assert_eq!(
+            c.signature(1),
+            "nrefs:1|case:mixed|eff:yes|nc:6|nw:0|space:no|version:2.6.0"
+        );
+
+        let cpp = Chrf { word_order: 2, ..Chrf::default() };
+        let s2 = cpp.corpus_score(&["the cat".to_string()], &[vec!["the cat".to_string()]]);
+        assert_eq!(s2.name(), "chrF2++");
+        assert!((s2.score - 100.0).abs() < 1e-9);
     }
 }
