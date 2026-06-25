@@ -62,6 +62,45 @@ pub fn tokenize_13a(line: &str) -> String {
     tokenize_regexp(&format!(" {line} "))
 }
 
+fn intl_rules() -> &'static [(Regex, &'static str)] {
+    static RULES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        vec![
+            // separate punctuation preceded by a non-digit
+            (Regex::new(r"(\P{N})(\p{P})").unwrap(), "$1 $2 "),
+            // separate punctuation followed by a non-digit
+            (Regex::new(r"(\p{P})(\P{N})").unwrap(), " $1 $2"),
+            // separate symbols
+            (Regex::new(r"(\p{S})").unwrap(), " $1 "),
+        ]
+    })
+}
+
+/// Port of `TokenizerV14International` (mteval-v14): split on Unicode punctuation and symbols,
+/// except a punctuation mark sitting between two digits (e.g. a decimal separator).
+pub fn tokenize_intl(line: &str) -> String {
+    let mut s = line.to_string();
+    for (re, repl) in intl_rules() {
+        s = re.replace_all(&s, *repl).into_owned();
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Port of `TokenizerChar`: one token per Unicode scalar value.
+pub fn tokenize_char(line: &str) -> String {
+    line.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// Dispatch by tokenizer name (`13a`, `intl`, `char`, `none`). Unknown names fall back to `13a`.
+fn apply_tokenizer(name: &str, line: &str) -> String {
+    match name {
+        "intl" => tokenize_intl(line),
+        "char" => tokenize_char(line),
+        "none" => line.to_string(),
+        _ => tokenize_13a(line),
+    }
+}
+
 // --- n-gram helpers (deep core) --------------------------------------------------------------
 
 /// Port of `extract_all_word_ngrams`: counts of every n-gram (1..=max_order) plus the token count.
@@ -263,6 +302,8 @@ pub struct Bleu {
     pub smooth_value: Option<f64>,
     pub max_ngram_order: usize,
     pub effective_order: bool,
+    /// Tokenizer name: `13a` (default), `intl`, `char`, or `none`.
+    pub tokenize: String,
 }
 
 impl Default for Bleu {
@@ -273,6 +314,7 @@ impl Default for Bleu {
             smooth_value: None,
             max_ngram_order: MAX_NGRAM_ORDER,
             effective_order: false,
+            tokenize: "13a".to_string(),
         }
     }
 }
@@ -286,7 +328,7 @@ impl Bleu {
         } else {
             sent
         };
-        tokenize_13a(s.trim_end())
+        apply_tokenizer(&self.tokenize, s.trim_end())
     }
 
     /// Corpus-level BLEU. `refs` is a list of reference *streams* (sacrebleu layout): `refs[r][i]`
@@ -357,5 +399,15 @@ mod tests {
             &[vec!["nothing alike at all".to_string()]],
         );
         assert_eq!(s.score, 0.0);
+    }
+
+    #[test]
+    fn other_tokenizers() {
+        assert_eq!(tokenize_char("abc"), "a b c");
+        assert_eq!(tokenize_char("我爱"), "我 爱");
+        assert_eq!(tokenize_intl("hello, world!"), "hello , world !");
+        assert_eq!(tokenize_intl("3.14"), "3.14"); // a dot between digits stays
+        assert_eq!(tokenize_intl("a+b"), "a + b"); // '+' is a symbol
+        assert_eq!(apply_tokenizer("none", "a , b"), "a , b"); // identity
     }
 }
