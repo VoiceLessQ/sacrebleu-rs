@@ -3,9 +3,9 @@
 A Rust port of [sacrebleu](https://github.com/mjpost/sacrebleu): reproducible machine-translation
 metrics. It is score-faithful to the Python package and verified by differential testing.
 
-Status: BLEU (tokenizers `13a`, `intl`, `char`, `none`), chrF/chrF++, and TER are implemented,
-each with its reproducibility signature. The tokenizers that need external dependencies
-(`ja-mecab`, `ko-mecab`, `spm`/`flores`) and TER's Asian normalization are not included.
+Status: BLEU (tokenizers `13a`, `intl`, `char`, `none`, and `spm`/`flores` via SentencePiece),
+chrF/chrF++, and TER are implemented, each with its reproducibility signature. The `ja-mecab` and
+`ko-mecab` tokenizers (which need MeCab) and TER's Asian normalization are not included.
 
 ## Usage
 
@@ -35,6 +35,17 @@ println!("{:.2}", chrf.corpus_score(&h, &r).score);
 println!("{:.2}", ter.corpus_score(&h, &r).score);
 ```
 
+For the `spm`/`flores` tokenizers, load a SentencePiece model and hand BLEU the processor:
+
+```rust
+use std::sync::Arc;
+use sacrebleu_rs::{Bleu, SentencePieceProcessor};
+
+let sp = Arc::new(SentencePieceProcessor::open("flores200_sacrebleu.model")?);
+let bleu = Bleu { tokenize: "flores200".into(), spm_model: Some(sp), ..Bleu::default() };
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 References use sacrebleu's layout: `refs[r][i]` is the r-th reference of the i-th hypothesis.
 
 ## Fidelity
@@ -53,7 +64,9 @@ idiomatic Rust translation rather than a line-for-line copy.
 
 Behavior is checked by differential testing against the Python `sacrebleu` package (2.6.0). A
 matrix of corpora and options runs through this crate and `BLEU`, `CHRF`, and `TER`, comparing the
-integer statistics and signatures for exact equality and each score to within 1e-9.
+integer statistics and signatures for exact equality and each score to within 1e-9. The `flores200`
+tokenizer is additionally checked piece-for-piece against `EncodeAsPieces` over thousands of lines
+of English and Japanese.
 
 ## License
 
