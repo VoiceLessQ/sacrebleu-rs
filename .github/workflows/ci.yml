@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.13"
+
+      - name: Install the sacrebleu oracle (pinned) and SentencePiece
+        run: pip install sacrebleu==2.6.0 sentencepiece
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (lib + diff harness binary)
+        run: cargo build --verbose
+
+      - name: Unit + doc tests
+        run: cargo test --verbose
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Differential test vs sacrebleu 2.6.0
+        run: python difftest.py

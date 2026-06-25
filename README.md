@@ -1,5 +1,7 @@
 # sacrebleu-rs
 
+[![CI](https://github.com/VoiceLessQ/sacrebleu-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/VoiceLessQ/sacrebleu-rs/actions/workflows/ci.yml)
+
 A Rust port of [sacrebleu](https://github.com/mjpost/sacrebleu): reproducible machine-translation
 metrics. It is score-faithful to the Python package and verified by differential testing.
 
