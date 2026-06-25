@@ -57,3 +57,4 @@ dependencies = [
 [[package]]
 name = "sentencepiece-rust"
 version = "0.1.1"
+source = "git+https://github.com/VoiceLessQ/sentencepiece-rust?tag=v0.1.1#b47652a370f7eb6febbbeea193867a4c555b4ee3"

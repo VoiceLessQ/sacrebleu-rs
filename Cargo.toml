@@ -13,5 +13,5 @@ exclude = ["/difftest.py", "/src/bin", "/.github"]
 [dependencies]
 regex = "1.12.4"
 # SentencePiece inference for the spm/flores tokenizers; same author's Python-parity port.
-# Needs >= 0.1.1 for encode_pieces (faithful EncodeAsPieces); path until that is published.
-sentencepiece-rust = { path = "../sentencepiece-rust", version = "0.1.1" }
+# Pinned to the git tag until 0.1.1 (which adds encode_pieces) is on crates.io.
+sentencepiece-rust = { git = "https://github.com/VoiceLessQ/sentencepiece-rust", tag = "v0.1.1" }
