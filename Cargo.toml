@@ -1,0 +1,14 @@
+[package]
+name = "sacrebleu-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust port of sacrebleu: reproducible BLEU (and later chrF/TER) machine-translation metrics, score-faithful to the Python package."
+license = "MIT"
+repository = "https://github.com/VoiceLessQ/sacrebleu-rs"
+readme = "README.md"
+keywords = ["bleu", "sacrebleu", "mt", "metric", "nlp"]
+categories = ["text-processing", "science"]
+exclude = ["/difftest.py", "/src/bin", "/.github"]
+
+[dependencies]
+regex = "1.12.4"
